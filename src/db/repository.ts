@@ -54,6 +54,7 @@ export interface AuthorizationCodeRow {
   code_challenge_method: string;
   expires_at: Date;
   consumed_at: Date | null;
+  issued_family_id: string | null;
 }
 
 export async function createAuthorizationCode(
@@ -96,7 +97,7 @@ export async function loadAuthorizationCode(
 ): Promise<AuthorizationCodeRow | null> {
   const { rows } = await pool.query<AuthorizationCodeRow>(
     `SELECT client_id, user_id, redirect_uri, scope, code_challenge,
-            code_challenge_method, expires_at, consumed_at
+            code_challenge_method, expires_at, consumed_at, issued_family_id
        FROM authorization_codes
       WHERE code_hash = $1`,
     [hashToken(code)],
@@ -126,6 +127,14 @@ export async function claimAuthorizationCode(pool: Pool, code: string): Promise<
     [hashToken(code)],
   );
   return (rowCount ?? 0) > 0;
+}
+
+/** Remember which refresh family this code produced, so a replay can revoke it. */
+export async function linkCodeToFamily(pool: Pool, code: string, familyId: string): Promise<void> {
+  await pool.query(`UPDATE authorization_codes SET issued_family_id = $2 WHERE code_hash = $1`, [
+    hashToken(code),
+    familyId,
+  ]);
 }
 
 /**

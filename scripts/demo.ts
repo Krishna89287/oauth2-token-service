@@ -26,7 +26,7 @@ const config: Config = {
 const REDIRECT = 'http://localhost:5173/callback';
 
 function line(label: string, value: string): void {
-  console.log(`  ${label.padEnd(22)} ${value}`);
+  console.log(`  ${label.padEnd(25)} ${value}`);
 }
 
 async function main(): Promise<void> {
@@ -95,7 +95,7 @@ async function main(): Promise<void> {
     redirect_uri: REDIRECT,
     code_verifier: randomBytes(32).toString('base64url'),
   });
-  line('code without verifier', `${stolen.statusCode} ${stolen.json().error}  <- PKCE stops this`);
+  line('stolen code, own verifier', `${stolen.statusCode} ${stolen.json().error}  <- PKCE stops this`);
 
   const exchanged = await token({
     grant_type: 'authorization_code',
@@ -105,7 +105,7 @@ async function main(): Promise<void> {
     code_verifier: verifier,
   });
   const session = exchanged.json();
-  line('code with verifier', `${exchanged.statusCode} access + refresh issued`);
+  line('code with verifier', `${exchanged.statusCode} ${exchanged.statusCode === 200 ? 'access + refresh issued' : exchanged.json().error}`);
   line('sub', String(decodeJwt(session.access_token).sub));
 
   const replayCode = await token({
@@ -117,12 +117,50 @@ async function main(): Promise<void> {
   });
   line('same code again', `${replayCode.statusCode} ${replayCode.json().error}  <- single use`);
 
+  // The replay above did more than fail. A code redeemed twice means someone has
+  // a copy of one we already honoured, so RFC 6749 4.1.2 says the tokens it issued
+  // go too. That session is now dead, which is why the next block logs in again.
+  const afterCodeReplay = await token({
+    grant_type: 'refresh_token',
+    client_id: 'web-app',
+    refresh_token: session.refresh_token,
+  });
+  line('its tokens after that', `${afterCodeReplay.statusCode} ${afterCodeReplay.json().error}  <- replay revoked them`);
+
   console.log('\n3. refresh rotation, and what happens when a token is stolen\n');
-  const first = session.refresh_token;
+
+  // A clean login, because the session above was correctly destroyed.
+  const freshVerifier = randomBytes(32).toString('base64url');
+  const freshChallenge = createHash('sha256').update(freshVerifier).digest('base64url');
+  const freshAuth = await app.inject({
+    method: 'POST',
+    url: '/oauth/authorize',
+    payload: {
+      email: 'ada@example.com',
+      password: 'correct-horse-battery',
+      client_id: 'web-app',
+      redirect_uri: REDIRECT,
+      scope: 'profile:read',
+      code_challenge: freshChallenge,
+      code_challenge_method: 'S256',
+    },
+  });
+  const freshCode = new URL(freshAuth.headers.location as string).searchParams.get('code') as string;
+  const freshSession = (
+    await token({
+      grant_type: 'authorization_code',
+      client_id: 'web-app',
+      code: freshCode,
+      redirect_uri: REDIRECT,
+      code_verifier: freshVerifier,
+    })
+  ).json();
+
+  const first = freshSession.refresh_token;
 
   const rotated = await token({ grant_type: 'refresh_token', client_id: 'web-app', refresh_token: first });
   const second = rotated.json().refresh_token;
-  line('honest refresh', `${rotated.statusCode} new refresh token issued`);
+  line('honest refresh', `${rotated.statusCode} ${rotated.statusCode === 200 ? 'new refresh token issued' : rotated.json().error}`);
   line('token changed', String(first !== second));
 
   const thief = await token({ grant_type: 'refresh_token', client_id: 'web-app', refresh_token: first });

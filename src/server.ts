@@ -5,14 +5,20 @@ import type { Config } from './config';
 import {
   claimAuthorizationCode,
   createAuthorizationCode,
-  loadAuthorizationCode,
   findClient,
   findUserByEmail,
+  linkCodeToFamily,
+  loadAuthorizationCode,
   type Client,
 } from './db/repository';
-import { verifyPassword } from './oauth/passwords';
-import { isValidCodeVerifier, verifyCodeChallenge, type CodeChallengeMethod } from './oauth/pkce';
-import { issueRefreshToken, rotateRefreshToken } from './oauth/refresh';
+import { verifyPassword, verifyPasswordOrBurnTime } from './oauth/passwords';
+import {
+  SUPPORTED_CODE_CHALLENGE_METHODS,
+  isValidCodeVerifier,
+  verifyCodeChallenge,
+  type CodeChallengeMethod,
+} from './oauth/pkce';
+import { issueRefreshToken, revokeFamily, rotateRefreshToken } from './oauth/refresh';
 import { formatScope, grantableScopes, parseScope, unauthorizedScopes } from './oauth/scopes';
 import { publicJwks, signAccessToken, verifyAccessToken, type Keys } from './oauth/tokens';
 
@@ -41,6 +47,12 @@ function fail(reply: FastifyReply, status: number, error: OAuthError, descriptio
  * ones we echo are the ones that look like scopes, and the rest are counted.
  */
 const SCOPE_SAFE = /^[A-Za-z0-9_:.-]{1,64}$/;
+
+/** One sentence for every way an authorization code can fail. See below. */
+const BAD_CODE = 'code is invalid, expired, or already used';
+
+/** What this server actually implements. Anything else is unsupported_grant_type. */
+const SUPPORTED_GRANTS = ['client_credentials', 'authorization_code', 'refresh_token'];
 
 function describeRejectedScopes(notAllowed: string[]): string {
   const safe = notAllowed.filter((s) => SCOPE_SAFE.test(s));
@@ -99,8 +111,8 @@ export function buildServer({ config, pool, keys }: BuildOptions): FastifyInstan
     token_endpoint: `${config.issuer}/oauth/token`,
     introspection_endpoint: `${config.issuer}/oauth/introspect`,
     jwks_uri: `${config.issuer}/.well-known/jwks.json`,
-    grant_types_supported: ['client_credentials', 'authorization_code', 'refresh_token'],
-    code_challenge_methods_supported: ['S256', 'plain'],
+    grant_types_supported: SUPPORTED_GRANTS,
+    code_challenge_methods_supported: SUPPORTED_CODE_CHALLENGE_METHODS,
     token_endpoint_auth_methods_supported: ['client_secret_post', 'none'],
   }));
 
@@ -115,23 +127,44 @@ export function buildServer({ config, pool, keys }: BuildOptions): FastifyInstan
   async function authenticateClient(
     clientId: string | undefined,
     clientSecret: string | undefined,
-  ): Promise<{ ok: true; client: Client } | { ok: false; reason: string }> {
-    if (!clientId) return { ok: false, reason: 'client_id is required' };
+  ): Promise<{ ok: true; client: Client } | { ok: false }> {
+    if (!clientId) return { ok: false };
 
     const client = await findClient(pool, clientId);
-    if (!client) return { ok: false, reason: 'unknown client' };
+
+    // An unknown client still pays for a scrypt, for the same reason a missing
+    // user does: returning early is a timing oracle that says which client ids
+    // are real. Measured at 31ms against 0.5ms before this.
+    if (!client) {
+      await verifyPasswordOrBurnTime(clientSecret ?? '', undefined);
+      return { ok: false };
+    }
 
     if (client.secretHash) {
-      if (!clientSecret) return { ok: false, reason: 'client_secret is required for this client' };
-      if (!(await verifyPassword(clientSecret, client.secretHash))) {
-        return { ok: false, reason: 'bad client credentials' };
+      // A client registered with a secret is never allowed to skip it, or the
+      // distinction between public and confidential is decorative.
+      if (!clientSecret) {
+        await verifyPasswordOrBurnTime('', undefined);
+        return { ok: false };
       }
+      if (!(await verifyPassword(clientSecret, client.secretHash))) return { ok: false };
     } else if (clientSecret) {
-      return { ok: false, reason: 'this client is public and must not send a secret' };
+      // A public client sending a secret means either a misconfigured client or
+      // someone guessing. Either way it is not the registration we have.
+      await verifyPasswordOrBurnTime(clientSecret, undefined);
+      return { ok: false };
     }
 
     return { ok: true, client };
   }
+
+  // A challenge is a base64url SHA256, so it is always exactly 43 characters.
+  const codeChallengeSchema = { type: 'string', minLength: 43, maxLength: 128 };
+  const codeChallengeMethodSchema = {
+    type: 'string',
+    enum: SUPPORTED_CODE_CHALLENGE_METHODS,
+    default: 'S256',
+  };
 
   const authorizeQuerySchema = {
     querystring: {
@@ -143,8 +176,34 @@ export function buildServer({ config, pool, keys }: BuildOptions): FastifyInstan
         redirect_uri: { type: 'string' },
         scope: { type: 'string' },
         state: { type: 'string' },
-        code_challenge: { type: 'string' },
-        code_challenge_method: { type: 'string', enum: ['S256', 'plain'], default: 'S256' },
+        code_challenge: codeChallengeSchema,
+        code_challenge_method: codeChallengeMethodSchema,
+      },
+    },
+  };
+
+  /**
+   * The POST needs the same schema as the GET, and for a while it had none.
+   *
+   * The GET is only where the browser is sent; the POST is what actually writes
+   * the row. Validating one and not the other meant the enum on the GET was
+   * decorative: anything could be posted straight here, including a challenge
+   * method that no longer exists, or none at all, which reached the database and
+   * came back as a 500 with the schema error attached.
+   */
+  const authorizeBodySchema = {
+    body: {
+      type: 'object',
+      required: ['email', 'password', 'client_id', 'redirect_uri', 'code_challenge'],
+      properties: {
+        email: { type: 'string' },
+        password: { type: 'string' },
+        client_id: { type: 'string' },
+        redirect_uri: { type: 'string' },
+        scope: { type: 'string' },
+        state: { type: 'string' },
+        code_challenge: codeChallengeSchema,
+        code_challenge_method: codeChallengeMethodSchema,
       },
     },
   };
@@ -209,7 +268,7 @@ export function buildServer({ config, pool, keys }: BuildOptions): FastifyInstan
       code_challenge: string;
       code_challenge_method?: CodeChallengeMethod;
     };
-  }>('/oauth/authorize', async (request, reply) => {
+  }>('/oauth/authorize', { schema: authorizeBodySchema }, async (request, reply) => {
     const b = request.body;
 
     const client = await findClient(pool, b.client_id);
@@ -217,8 +276,21 @@ export function buildServer({ config, pool, keys }: BuildOptions): FastifyInstan
       return fail(reply, 400, 'invalid_request', 'unknown client or redirect_uri');
     }
 
+    // The same check the GET does. Leaving it off here meant a client registered
+    // only for client_credentials could post straight past the form and be handed
+    // a real authorization code. Redemption refused it, but a gate that only holds
+    // in one of the two places it is written is not a gate.
+    if (!client.allowedGrants.includes('authorization_code')) {
+      return fail(reply, 400, 'unauthorized_client', 'client may not use authorization_code');
+    }
+
+    const notAllowedHere = unauthorizedScopes(parseScope(b.scope), client.allowedScopes);
+    if (notAllowedHere.length > 0) {
+      return fail(reply, 400, 'invalid_scope', describeRejectedScopes(notAllowedHere));
+    }
+
     const user = await findUserByEmail(pool, b.email ?? '');
-    const passwordOk = user ? await verifyPassword(b.password ?? '', user.passwordHash) : false;
+    const passwordOk = await verifyPasswordOrBurnTime(b.password ?? '', user?.passwordHash);
 
     if (!user || !passwordOk) {
       // One message for both cases. Saying "no such user" tells an attacker which
@@ -283,8 +355,17 @@ export function buildServer({ config, pool, keys }: BuildOptions): FastifyInstan
     reply.header('cache-control', 'no-store').header('pragma', 'no-cache');
 
     const auth = await authenticateClient(b.client_id, b.client_secret);
-    if (!auth.ok) return fail(reply, 401, 'invalid_client', auth.reason);
+    if (!auth.ok) return fail(reply, 401, 'invalid_client', 'client authentication failed');
     const { client } = auth;
+
+    // Order matters. Checking the registration first meant an unknown grant came
+    // back as unauthorized_client, which reads as "ask an admin to enable it" when
+    // the honest answer is that this server does not implement it at all. The
+    // password grant is the one that hits this, and it is not here on purpose: it
+    // hands the user's password to the client.
+    if (!SUPPORTED_GRANTS.includes(b.grant_type)) {
+      return fail(reply, 400, 'unsupported_grant_type', `${b.grant_type} is not supported`);
+    }
 
     if (!client.allowedGrants.includes(b.grant_type)) {
       return fail(reply, 400, 'unauthorized_client', `client may not use ${b.grant_type}`);
@@ -329,32 +410,33 @@ export function buildServer({ config, pool, keys }: BuildOptions): FastifyInstan
 
       const row = await loadAuthorizationCode(pool, b.code);
 
-      if (!row) return fail(reply, 400, 'invalid_grant', 'code is invalid or already used');
+      if (!row) return fail(reply, 400, 'invalid_grant', BAD_CODE);
 
       if (row.consumed_at) {
         // A code that turns up twice means a copy is loose. The client gets the
         // same generic error as any other failure, but this one is worth a log.
         request.log.warn({ clientId: client.id }, 'authorization code replayed');
-        return fail(reply, 400, 'invalid_grant', 'code is invalid or already used');
+        if (row.issued_family_id) await revokeFamily(pool, row.issued_family_id);
+        return fail(reply, 400, 'invalid_grant', BAD_CODE);
       }
 
+      // Every one of these answers with the same words. Naming which check failed
+      // tells whoever is holding a code they should not have exactly what they
+      // still need, and separates "expired" from "never existed" for free.
       if (row.client_id !== client.id) {
-        return fail(reply, 400, 'invalid_grant', 'code was not issued to this client');
+        request.log.warn({ clientId: client.id }, 'code redeemed by the wrong client');
+        return fail(reply, 400, 'invalid_grant', BAD_CODE);
       }
 
-      if (row.expires_at.getTime() <= Date.now()) {
-        return fail(reply, 400, 'invalid_grant', 'code has expired');
-      }
+      if (row.expires_at.getTime() <= Date.now()) return fail(reply, 400, 'invalid_grant', BAD_CODE);
 
       // The redirect_uri is checked again even though it was checked at /authorize.
       // The spec requires it, and it stops a code obtained through one registered
       // uri being redeemed as though it came from another.
-      if (b.redirect_uri !== row.redirect_uri) {
-        return fail(reply, 400, 'invalid_grant', 'redirect_uri does not match the authorization request');
-      }
+      if (b.redirect_uri !== row.redirect_uri) return fail(reply, 400, 'invalid_grant', BAD_CODE);
 
-      if (!verifyCodeChallenge(b.code_verifier, row.code_challenge, row.code_challenge_method as CodeChallengeMethod)) {
-        return fail(reply, 400, 'invalid_grant', 'code_verifier does not match the challenge');
+      if (!verifyCodeChallenge(b.code_verifier, row.code_challenge, row.code_challenge_method)) {
+        return fail(reply, 400, 'invalid_grant', BAD_CODE);
       }
 
       // Everything checks out, so spend it. If someone else spent it between the
@@ -362,7 +444,7 @@ export function buildServer({ config, pool, keys }: BuildOptions): FastifyInstan
       // the database, not by the check we did a moment ago.
       if (!(await claimAuthorizationCode(pool, b.code))) {
         request.log.warn({ clientId: client.id }, 'authorization code redeemed twice concurrently');
-        return fail(reply, 400, 'invalid_grant', 'code is invalid or already used');
+        return fail(reply, 400, 'invalid_grant', BAD_CODE);
       }
 
       const access = await signAccessToken(keys, {
@@ -380,6 +462,9 @@ export function buildServer({ config, pool, keys }: BuildOptions): FastifyInstan
         scope: row.scope,
         ttlSeconds: config.refreshTokenTtlSeconds,
       });
+
+      // So that if this code is ever replayed, we know what to revoke.
+      await linkCodeToFamily(pool, b.code, refresh.familyId);
 
       return reply.send({
         access_token: access.token,
@@ -446,7 +531,7 @@ export function buildServer({ config, pool, keys }: BuildOptions): FastifyInstan
     '/oauth/introspect',
     async (request, reply) => {
       const auth = await authenticateClient(request.body?.client_id, request.body?.client_secret);
-      if (!auth.ok) return fail(reply, 401, 'invalid_client', auth.reason);
+      if (!auth.ok) return fail(reply, 401, 'invalid_client', 'client authentication failed');
 
       reply.header('cache-control', 'no-store');
 

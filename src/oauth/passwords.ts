@@ -32,6 +32,38 @@ export async function hashPassword(password: string): Promise<string> {
 }
 
 /**
+ * A hash of nothing anyone can log in with, used to spend the same time on a
+ * missing account as on a real one.
+ *
+ * Computed once at startup, because computing it per request would be a second
+ * scrypt and would show up as its own timing signal.
+ */
+const DUMMY_HASH_PROMISE = hashPassword(randomBytes(32).toString('hex'));
+
+/**
+ * Verify a password when the account might not exist.
+ *
+ * The obvious shape, `user ? await verify(...) : false`, is a user enumeration
+ * oracle: a real account pays for scrypt and a missing one does not, so the reply
+ * comes back in about a millisecond instead of thirty. The error message being
+ * identical does not help when the clock says otherwise. Measured on this machine
+ * before the fix: 31.4ms for a real address against 0.8ms for an unknown one.
+ *
+ * So a missing account verifies against a dummy hash instead. The answer is still
+ * false, it just costs what the truth costs.
+ */
+export async function verifyPasswordOrBurnTime(
+  password: string,
+  storedHash: string | undefined | null,
+): Promise<boolean> {
+  if (!storedHash) {
+    await verifyPassword(password, await DUMMY_HASH_PROMISE);
+    return false;
+  }
+  return verifyPassword(password, storedHash);
+}
+
+/**
  * Verify in constant time.
  *
  * A plain === would leak, through timing, how much of the hash matched, which

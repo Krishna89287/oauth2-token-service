@@ -29,7 +29,10 @@ CREATE TABLE IF NOT EXISTS authorization_codes (
     -- An authorization code is single use. Rather than delete it on redemption we
     -- mark it, so that a second attempt is a detectable event and not just a
     -- missing row that looks the same as a typo.
-    consumed_at           TIMESTAMPTZ
+    consumed_at           TIMESTAMPTZ,
+    -- The refresh family this code produced, so that a replayed code can revoke
+    -- the tokens it already handed out. RFC 6749 4.1.2 asks for this.
+    issued_family_id      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS authorization_codes_expires_idx ON authorization_codes (expires_at);

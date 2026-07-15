@@ -709,8 +709,11 @@ describe('grant types', () => {
       client_secret: 'reporting-secret-do-not-use-in-production',
     });
 
-    // The password grant is deprecated and deliberately not implemented.
+    // unsupported_grant_type, not unauthorized_client. The difference matters to
+    // whoever is integrating: one reads as "ask an admin to turn it on", the other
+    // says this server does not do that. The password grant hands the user's
+    // password to the client, so it is not here on purpose.
     expect(res.statusCode).toBe(400);
-    expect(res.json().error).toBe('unauthorized_client');
+    expect(res.json().error).toBe('unsupported_grant_type');
   });
 });

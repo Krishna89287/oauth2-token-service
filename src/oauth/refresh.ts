@@ -55,7 +55,15 @@ export async function issueRefreshToken(
   return { token, familyId, expiresAt };
 }
 
-async function revokeFamily(db: Pool | PoolClient, familyId: string): Promise<void> {
+/**
+ * Kill every token in a chain.
+ *
+ * Called when a refresh token is replayed, and when an authorization code is
+ * replayed: RFC 6749 4.1.2 says a code used twice SHOULD revoke what it issued,
+ * because a second redemption means someone has a copy of a code we already
+ * honoured, and the tokens that came out of it may be theirs.
+ */
+export async function revokeFamily(db: Pool | PoolClient, familyId: string): Promise<void> {
   await db.query(
     `UPDATE refresh_tokens SET revoked_at = now() WHERE family_id = $1 AND revoked_at IS NULL`,
     [familyId],

@@ -1,5 +1,10 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { isValidCodeVerifier, verifyCodeChallenge } from '../../src/oauth/pkce';
+import {
+  SUPPORTED_CODE_CHALLENGE_METHODS,
+  isSupportedCodeChallengeMethod,
+  isValidCodeVerifier,
+  verifyCodeChallenge,
+} from '../../src/oauth/pkce';
 
 /** What a well behaved client does before it starts the flow. */
 function makePair(): { verifier: string; challenge: string } {
@@ -46,15 +51,37 @@ describe('verifyCodeChallenge S256', () => {
   });
 });
 
-describe('verifyCodeChallenge plain', () => {
-  it('compares the verifier directly', () => {
-    expect(verifyCodeChallenge('same-value', 'same-value', 'plain')).toBe(true);
-    expect(verifyCodeChallenge('one', 'other', 'plain')).toBe(false);
+describe('the plain method is not accepted at all', () => {
+  it('refuses plain even when the verifier equals the challenge', () => {
+    // This is the whole downgrade. With plain, the challenge IS the verifier, and
+    // it sits in the authorize URL in the clear. An attacker crafts the URL with a
+    // challenge they chose, lets the victim log in at the real server, intercepts
+    // the code, and redeems it with the verifier they already have. Accepting
+    // plain alongside S256 does not add compatibility, it hands out a bypass.
+    expect(verifyCodeChallenge('same-value', 'same-value', 'plain')).toBe(false);
   });
 
-  it('does not accept an S256 challenge when the method is plain', () => {
+  it('refuses plain for a real S256 pair too', () => {
     const { verifier, challenge } = makePair();
     expect(verifyCodeChallenge(verifier, challenge, 'plain')).toBe(false);
+  });
+
+  it('fails closed on a method nobody has heard of', () => {
+    const { verifier, challenge } = makePair();
+
+    // The dangerous shape is `if (method === 'S256') { hash } else { compare }`,
+    // where anything unrecognised silently becomes a plain comparison. Then any
+    // string an attacker can get written into the stored row is a way past PKCE.
+    expect(verifyCodeChallenge(verifier, challenge, 'S256-but-not-really')).toBe(false);
+    expect(verifyCodeChallenge(verifier, verifier, 'S256-but-not-really')).toBe(false);
+    expect(verifyCodeChallenge(verifier, challenge, '')).toBe(false);
+    expect(verifyCodeChallenge(verifier, challenge, 's256')).toBe(false);
+  });
+
+  it('only advertises what it accepts', () => {
+    expect(SUPPORTED_CODE_CHALLENGE_METHODS).toEqual(['S256']);
+    expect(isSupportedCodeChallengeMethod('S256')).toBe(true);
+    expect(isSupportedCodeChallengeMethod('plain')).toBe(false);
   });
 });
 

@@ -1,6 +1,25 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 
-export type CodeChallengeMethod = 'S256' | 'plain';
+/**
+ * S256 only.
+ *
+ * RFC 7636 also defines `plain`, where the challenge is the verifier in the clear.
+ * It is worse than useless here: PKCE's threat model is an attacker who can read
+ * the redirect, and with `plain` that attacker can simply craft the authorize URL
+ * with a challenge they chose, wait for the victim to log in at the real server,
+ * intercept the code, and redeem it with the verifier they already have. Accepting
+ * `plain` alongside S256 does not add compatibility, it hands anyone a downgrade.
+ *
+ * RFC 7636 section 4.2 says a client that can do S256 must, and OAuth 2.1 drops
+ * `plain` entirely. So does this.
+ */
+export type CodeChallengeMethod = 'S256';
+
+export const SUPPORTED_CODE_CHALLENGE_METHODS: readonly string[] = ['S256'];
+
+export function isSupportedCodeChallengeMethod(method: string): method is CodeChallengeMethod {
+  return method === 'S256';
+}
 
 /** base64url, which is what RFC 7636 asks for and what Buffer calls base64url. */
 function sha256Base64Url(input: string): string {
@@ -22,19 +41,13 @@ function constantTimeEquals(a: string, b: string): boolean {
  * whoever redeems it must also present the verifier whose hash matches the
  * challenge, and only the app that started the flow has that.
  *
- * plain is in the spec and is accepted here only because some old clients still
- * send it. It offers no protection against an attacker who saw the challenge, so
- * S256 is what anything new should use.
+ * Fails closed. An unrecognised method is not quietly treated as a plain string
+ * compare, because that turns any typo, or anything an attacker can write into the
+ * stored row, into a way around the check.
  */
-export function verifyCodeChallenge(
-  verifier: string,
-  challenge: string,
-  method: CodeChallengeMethod,
-): boolean {
-  if (method === 'S256') {
-    return constantTimeEquals(sha256Base64Url(verifier), challenge);
-  }
-  return constantTimeEquals(verifier, challenge);
+export function verifyCodeChallenge(verifier: string, challenge: string, method: string): boolean {
+  if (!isSupportedCodeChallengeMethod(method)) return false;
+  return constantTimeEquals(sha256Base64Url(verifier), challenge);
 }
 
 /**

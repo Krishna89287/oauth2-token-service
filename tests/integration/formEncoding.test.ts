@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import type { Pool } from 'pg';
 import type { Config } from '../../src/config';
@@ -104,8 +105,8 @@ describe('the token endpoint speaks what real clients speak', () => {
         client_id: 'web-app',
         redirect_uri: 'http://localhost:5173/callback',
         scope: 'profile:read',
-        code_challenge: 'a'.repeat(43),
-        code_challenge_method: 'plain',
+        code_challenge: createHash('sha256').update('v'.repeat(43)).digest('base64url'),
+        code_challenge_method: 'S256',
       }).toString(),
     });
 
